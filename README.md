@@ -7,13 +7,13 @@ Move all messages from one SQS queue, to another.
 
 ### Source
 
-    go get github.com/scottjbarr/sqsmv
+    go get github.com/juju227/sqsmv
 
 
 ### Binaries
 
 Download the appropriate binary from the
-[Releases](https://github.com/scottjbarr/sqsmv/releases) page.
+[Releases](https://github.com/juju227/sqsmv/releases) page.
 
 
 ## Configuration
