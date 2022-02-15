@@ -5,7 +5,6 @@ import (
 	"flag"
 	"log"
 	"os"
-	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -38,10 +37,7 @@ func newClient(src string, dest string) *client {
 }
 
 //transferMessages loops, transferring a number of messages from the src to the dest at an interval.
-func (c *client) transferMessages(ctx context.Context, wgOuter *sync.WaitGroup) error {
-
-	defer wgOuter.Done()
-
+func (c *client) transferMessages(ctx context.Context) error {
 	resp, err := c.session.ReceiveMessage(ctx, c.rmi)
 	if err != nil {
 		log.Println(err)
@@ -86,7 +82,6 @@ func (c *client) transferMessages(ctx context.Context, wgOuter *sync.WaitGroup) 
 func main() {
 	src := flag.String("src", "", "source queue")
 	dest := flag.String("dest", "", "destination queue")
-	nClients := flag.Int("clients", 1, "number of clients")
 	flag.Parse()
 
 	if *src == "" || *dest == "" {
@@ -94,22 +89,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *nClients < 1 {
-		*nClients = 1
-	}
-
 	log.Printf("source queue : %v", *src)
 	log.Printf("destination queue : %v", *dest)
-	log.Printf("number of clients : %v", *nClients)
 
 	client := newClient(*src, *dest)
 
-	var wg sync.WaitGroup
-	for i := 1; i <= *nClients; i++ {
-		wg.Add(i)
-		go client.transferMessages(context.TODO(), &wg)
-	}
-	wg.Wait()
-
+	client.transferMessages(context.TODO())
 	log.Println("all done")
 }
