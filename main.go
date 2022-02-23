@@ -115,8 +115,6 @@ func (c *client) transferMessagesToQueue(ctx context.Context, ms []types.Message
 
 func main() {
 	var wg sync.WaitGroup
-	var qErr *error
-	var bErr *error
 
 	src := flag.String("src", "", "source queue")
 	dest := flag.String("dest", "", "destination queue")
@@ -147,36 +145,36 @@ func main() {
 
 	if *dest != "" {
 		wg.Add(1)
-		go func(err *error) {
+		go func() {
 			log.Println("transfer Message to queue")
 			defer wg.Done()
-			*err = client.transferMessagesToQueue(context.TODO(), ms)
+			err = client.transferMessagesToQueue(context.TODO(), ms)
 			if err != nil {
 				log.Println(err)
+				os.Exit(1)
 			}
-		}(qErr)
+		}()
 	}
 
 	if *bucket != "" {
 		wg.Add(1)
-		go func(err *error) {
+		go func() {
 			log.Println("transfer Message to bucket")
 			defer wg.Done()
-			*err = client.transferMessagesToBucket(context.TODO(), ms)
+			err = client.transferMessagesToBucket(context.TODO(), ms)
 			if err != nil {
 				log.Println(err)
+				os.Exit(1)
 			}
-		}(bErr)
+		}()
 	}
 
 	wg.Wait()
 
-	if bErr == nil || dest == nil {
-		err = client.purgeQueue(context.TODO(), ms)
-		if err != nil {
-			log.Println(err.Error())
-			os.Exit(1)
-		}
+	err = client.purgeQueue(context.TODO(), ms)
+	if err != nil {
+		log.Println(err.Error())
+		os.Exit(1)
 	}
 
 	log.Println("all done")
