@@ -1,99 +1,183 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 )
 
 type client struct {
-	session *sqs.Client
-	rmi     *sqs.ReceiveMessageInput
-	dest    string
+	session  *sqs.Client
+	bSession *s3.Client
+	con      conf
 }
 
-func newClient(src string, dest string) *client {
+type conf struct {
+	source string
+	destQ  string
+	bucket string
+}
+
+func newClient(c conf) *client {
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
 		log.Fatalf(err.Error())
 	}
 
 	return &client{
-		session: sqs.NewFromConfig(cfg),
-		rmi: &sqs.ReceiveMessageInput{
-			QueueUrl:              aws.String(src),
-			MaxNumberOfMessages:   10,
-			WaitTimeSeconds:       0,
-			MessageAttributeNames: []string{"ALL"},
-		},
-		dest: dest,
+		session:  sqs.NewFromConfig(cfg),
+		bSession: s3.NewFromConfig(cfg),
+		con:      c,
 	}
 }
 
-//transferMessages loops, transferring a number of messages from the src to the dest at an interval.
-func (c *client) transferMessages(ctx context.Context) error {
-	resp, err := c.session.ReceiveMessage(ctx, c.rmi)
+func (c *client) pullMessages(ctx context.Context) ([]types.Message, error) {
+	resp, err := c.session.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+		QueueUrl:              aws.String(c.con.source),
+		MaxNumberOfMessages:   10,
+		WaitTimeSeconds:       0,
+		MessageAttributeNames: []string{"ALL"},
+	})
 	if err != nil {
 		log.Println(err)
+		return nil, err
+	}
+
+	log.Printf("received %v messages...", len(resp.Messages))
+	return resp.Messages, nil
+}
+
+func (c *client) transferMessagesToBucket(ctx context.Context, ms []types.Message) error {
+	by, err := json.Marshal(ms)
+	if err != nil {
 		return err
 	}
 
-	lastMessageCount := len(resp.Messages)
-	log.Printf("received %v messages...", len(resp.Messages))
+	_, err = c.bSession.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(c.con.bucket),
+		Key:    aws.String(fmt.Sprintf("%s-%s", c.con.source, time.Now().UTC().String())),
+		Body:   bytes.NewReader(by),
+	})
+	if err != nil {
+		return err
+	}
 
-	smsg := make([]types.SendMessageBatchRequestEntry, 0, lastMessageCount)
-	dmsg := make([]types.DeleteMessageBatchRequestEntry, 0, lastMessageCount)
+	return nil
+}
 
-	//loading batch
-	for _, m := range resp.Messages {
-		smsg = append(smsg, types.SendMessageBatchRequestEntry{
-			Id:          m.MessageId,
-			MessageBody: m.Body,
-		})
-
+func (c *client) purgeQueue(ctx context.Context, ms []types.Message) error {
+	dmsg := make([]types.DeleteMessageBatchRequestEntry, 0, len(ms))
+	for _, m := range ms {
 		dmsg = append(dmsg, types.DeleteMessageBatchRequestEntry{
 			Id:            m.MessageId,
 			ReceiptHandle: m.ReceiptHandle,
 		})
 	}
-
-	_, err = c.session.SendMessageBatch(ctx, &sqs.SendMessageBatchInput{
-		Entries:  smsg,
-		QueueUrl: aws.String(c.dest),
+	_, err := c.session.DeleteMessageBatch(ctx, &sqs.DeleteMessageBatchInput{
+		Entries:  dmsg,
+		QueueUrl: aws.String(c.con.source),
 	})
-	if err != nil {
-		log.Println(err.Error())
-		return err
+	return err
+}
+
+//transferMessages loops, transferring a number of messages from the src to the dest at an interval.
+func (c *client) transferMessagesToQueue(ctx context.Context, ms []types.Message) error {
+	lastMessageCount := len(ms)
+	smsg := make([]types.SendMessageBatchRequestEntry, 0, lastMessageCount)
+
+	//loading batch
+	for _, m := range ms {
+		smsg = append(smsg, types.SendMessageBatchRequestEntry{
+			Id:          m.MessageId,
+			MessageBody: m.Body,
+		})
+
 	}
 
-	_, err = c.session.DeleteMessageBatch(ctx, &sqs.DeleteMessageBatchInput{
-		Entries:  dmsg,
-		QueueUrl: c.rmi.QueueUrl,
+	_, err := c.session.SendMessageBatch(ctx, &sqs.SendMessageBatchInput{
+		Entries:  smsg,
+		QueueUrl: aws.String(c.con.destQ),
 	})
 	return err
 }
 
 func main() {
+	var wg sync.WaitGroup
+	var qErr *error
+	var bErr *error
+
 	src := flag.String("src", "", "source queue")
 	dest := flag.String("dest", "", "destination queue")
+	bucket := flag.String("bucket", "", "destination bucket")
+
 	flag.Parse()
 
-	if *src == "" || *dest == "" {
+	if *src == "" || (*dest == "" && *bucket == "") {
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	log.Printf("source queue : %v", *src)
-	log.Printf("destination queue : %v", *dest)
+	log.Printf("source queue : %s", *src)
+	log.Printf("destination queue : %s", *dest)
+	log.Printf("destination bucket : %s", *bucket)
 
-	client := newClient(*src, *dest)
+	client := newClient(conf{
+		source: *src,
+		destQ:  *dest,
+		bucket: *bucket,
+	})
 
-	client.transferMessages(context.TODO())
+	ms, err := client.pullMessages(context.TODO())
+	if err != nil {
+		log.Println(err.Error())
+		os.Exit(1)
+	}
+
+	if *dest != "" {
+		wg.Add(1)
+		go func(err *error) {
+			log.Println("transfer Message to queue")
+			defer wg.Done()
+			*err = client.transferMessagesToQueue(context.TODO(), ms)
+			if err != nil {
+				log.Println(err)
+			}
+		}(qErr)
+	}
+
+	if *bucket != "" {
+		wg.Add(1)
+		go func(err *error) {
+			log.Println("transfer Message to bucket")
+			defer wg.Done()
+			*err = client.transferMessagesToBucket(context.TODO(), ms)
+			if err != nil {
+				log.Println(err)
+			}
+		}(bErr)
+	}
+
+	wg.Wait()
+
+	if bErr == nil || dest == nil {
+		err = client.purgeQueue(context.TODO(), ms)
+		if err != nil {
+			log.Println(err.Error())
+			os.Exit(1)
+		}
+	}
+
 	log.Println("all done")
 }
