@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"os"
 	"sync"
 	"time"
 
@@ -30,7 +29,7 @@ type conf struct {
 	bucket string
 }
 
-func newClient(c conf) *client {
+func New(c conf) (*client, error) {
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
 		log.Fatalf(err.Error())
@@ -40,7 +39,7 @@ func newClient(c conf) *client {
 		session:  sqs.NewFromConfig(cfg),
 		bSession: s3.NewFromConfig(cfg),
 		con:      c,
-	}
+	}, nil
 }
 
 func (c *client) pullMessages(ctx context.Context) ([]types.Message, error) {
@@ -51,7 +50,6 @@ func (c *client) pullMessages(ctx context.Context) ([]types.Message, error) {
 		MessageAttributeNames: []string{"ALL"},
 	})
 	if err != nil {
-		log.Println(err)
 		return nil, err
 	}
 
@@ -64,17 +62,12 @@ func (c *client) transferMessagesToBucket(ctx context.Context, ms []types.Messag
 	if err != nil {
 		return err
 	}
-
 	_, err = c.bSession.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(c.con.bucket),
 		Key:    aws.String(fmt.Sprintf("%s-%s", c.con.source, time.Now().UTC().String())),
 		Body:   bytes.NewReader(by),
 	})
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }
 
 func (c *client) purgeQueue(ctx context.Context, ms []types.Message) error {
@@ -92,11 +85,9 @@ func (c *client) purgeQueue(ctx context.Context, ms []types.Message) error {
 	return err
 }
 
-//transferMessages loops, transferring a number of messages from the src to the dest at an interval.
+//  transferMessages loops, transferring a number of messages from the src to the dest at an interval.
 func (c *client) transferMessagesToQueue(ctx context.Context, ms []types.Message) error {
-	lastMessageCount := len(ms)
-	smsg := make([]types.SendMessageBatchRequestEntry, 0, lastMessageCount)
-
+	smsg := make([]types.SendMessageBatchRequestEntry, 0, len(ms))
 	//loading batch
 	for _, m := range ms {
 		smsg = append(smsg, types.SendMessageBatchRequestEntry{
@@ -105,7 +96,6 @@ func (c *client) transferMessagesToQueue(ctx context.Context, ms []types.Message
 		})
 
 	}
-
 	_, err := c.session.SendMessageBatch(ctx, &sqs.SendMessageBatchInput{
 		Entries:  smsg,
 		QueueUrl: aws.String(c.con.destQ),
@@ -124,23 +114,25 @@ func main() {
 
 	if *src == "" || (*dest == "" && *bucket == "") {
 		flag.Usage()
-		os.Exit(1)
+		log.Fatal("Missing flag")
 	}
 
 	log.Printf("source queue : %s", *src)
 	log.Printf("destination queue : %s", *dest)
 	log.Printf("destination bucket : %s", *bucket)
 
-	client := newClient(conf{
+	client, err := New(conf{
 		source: *src,
 		destQ:  *dest,
 		bucket: *bucket,
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	ms, err := client.pullMessages(context.TODO())
 	if err != nil {
-		log.Println(err.Error())
-		os.Exit(1)
+		log.Fatal(err.Error())
 	}
 
 	if *dest != "" {
@@ -150,8 +142,7 @@ func main() {
 			defer wg.Done()
 			err = client.transferMessagesToQueue(context.TODO(), ms)
 			if err != nil {
-				log.Println(err)
-				os.Exit(1)
+				log.Fatal(err)
 			}
 		}()
 	}
@@ -163,18 +154,17 @@ func main() {
 			defer wg.Done()
 			err = client.transferMessagesToBucket(context.TODO(), ms)
 			if err != nil {
-				log.Println(err)
-				os.Exit(1)
+				log.Fatal(err)
 			}
 		}()
 	}
 
+	// will wait until subtask as completed
 	wg.Wait()
 
 	err = client.purgeQueue(context.TODO(), ms)
 	if err != nil {
-		log.Println(err.Error())
-		os.Exit(1)
+		log.Fatal(err.Error())
 	}
 
 	log.Println("all done")
